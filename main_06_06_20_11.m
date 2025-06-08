@@ -16,7 +16,7 @@ end
 %% MAPPA E PARAMETRI
 
 % trascrizione mappa
-img = imread('rotated_maze.pgm');
+img = imread('cropped_maze.pgm');
 map = img < 250;
 
 % plot di sicurezza
@@ -25,14 +25,15 @@ imagesc(map);
 colormap(gray);
 axis equal tight;
 
+%%
 mapSize = size(map);
 odom_sub = rossubscriber('/odom', 'nav_msgs/Odometry');
 odom_msg = receive(odom_sub, 3);
 position = odom_msg.Pose.Pose.Position;
 ori = odom_msg.Pose.Pose.Orientation;
 [x_start, y_start] = coordToCell(position.X, position.Y, map);
-start = [y_start, x_start];
-goal = [90, 85];
+start = [x_start, y_start];
+goal = [187, 70];
 
 %% A* + smoothing
 % [v, w] = function a*_smooth(map,start,goal, ...)
@@ -79,57 +80,79 @@ legend('Start', 'Goal', 'Path', 'Robot', 'Ostacoli Dinamici', 'Location','northe
 grid on;
 %% 
 % Parametri
-map_resolution = 0.05; % metri per cella (modifica se necessario)
-K_v = 1000;  % guadagno per velocità lineare
-K_w = -1;  % guadagno per velocità angolare
+map_resolution = 0.05;  % metri per cella
+K_v = 0.8;              % guadagno per velocità lineare
+K_w = 0.7;              % guadagno per velocità angolare
+max_v = 0.4;            % velocità lineare massima
+max_w = 1.0;            % velocità angolare massima
+goal_tolerance = 0.1;   % distanza minima al target
+angle_tolerance = deg2rad(10); % tolleranza angolare (~10°)
 
+% Publisher comandi velocità
 vel_pub = rospublisher('/cmd_vel', 'geometry_msgs/Twist');
 vel_msg = rosmessage(vel_pub);
 
-% Converte path in coordinate reali
+% Subscriber alla posizione del robot
+odom_sub = rossubscriber('/odom', 'nav_msgs/Odometry');
+
+% Converte path da celle a metri
 clean_path_m = (clean_path * map_resolution);
 
-% Loop principale
+% Loop sui punti del path
 for i = 1:(size(clean_path_m, 1)-1)
-    target = clean_path_m(i+1, :)'; % Punto target [x; y]
-    error_theta = 0;
-    % Estrai il quaternione
-    quat = [odom_msg.Pose.Pose.Orientation.W, ...
-        odom_msg.Pose.Pose.Orientation.X, ...
-        odom_msg.Pose.Pose.Orientation.Y, ...
-        odom_msg.Pose.Pose.Orientation.Z];
+    target = clean_path_m(i+1, :)';  % punto target [x; y]
+    reached = false;
 
-    % Convertilo in angoli di Eulero [roll, pitch, yaw]
-    eul = quat2eul(quat);
+    while ~reached
+        % Leggi odometria
+        odom_msg = receive(odom_sub, 1);
+        pos = odom_msg.Pose.Pose.Position;
+        ori = odom_msg.Pose.Pose.Orientation;
 
-    % L'angolo di yaw è il terzo valore
-    yaw = eul(3);
+        % Estrai stato attuale
+        x = pos.X;
+        y = pos.Y;
+        [x_current, y_current] = coordToCell(y, x, map);
+        quat = [ori.W, ori.X, ori.Y, ori.Z];
+        eul = quat2eul(quat);
+        yaw = eul(1);
+        current_pose = [x_current; y_current; yaw];
 
-    
-    % Recupera posizione corrente del robot (qui va integrato un listener per stimare pose reale)
-    % Per ora, simuliamo posizione attuale come il punto corrente del path:
-    current_pose = [clean_path_m(i, 1); clean_path_m(i, 2); yaw]; % [x; y; theta]
-    
-    % Calcola direzione e distanza
-    delta = target(1:2) - current_pose(1:2);
-    rho = norm(delta);
-    theta_target = atan2(delta(2), delta(1));
-    error_theta = wrapToPi(theta_target - current_pose(3));
+        % Calcola distanza e angolo
+        delta = target(1:2) - current_pose(1:2);
+        rho = norm(delta);
+        theta_target = atan2(delta(2), delta(1));
+        error_theta = wrapToPi(theta_target - yaw);
 
-    % Controller proporzionale
-    v = K_v * rho;
-    w = K_w * error_theta;
-    
-    % Costruisci e pubblica messaggio
-    vel_msg.Linear.X = v;
-    vel_msg.Angular.Z = w;
-    send(vel_pub, vel_msg);
-    
-    % Debug info
-    fprintf("Target: [%.2f %.2f] | v = %.2f, w = %.2f\n", target(1), target(2), v, w);
-    yaw = yaw + error_theta;
-    
-    pause(0.1); % tempo tra i comandi
+        % Controllo rotazione prima di avanzare
+        if abs(error_theta) > angle_tolerance
+            v = 0;
+            w = K_w * error_theta;
+        else
+            v = K_v * rho;
+            w = 0;
+        end
+
+        % Limiti di velocità
+        v = min(max(v, -max_v), max_v);
+        w = min(max(w, -max_w), max_w);
+
+        % Costruisci e invia il messaggio
+        vel_msg.Linear.X = v;
+        vel_msg.Angular.Z = w;
+        send(vel_pub, vel_msg);
+
+        % Debug
+        fprintf("→ Target: [%.2f %.2f] | rho = %.2f | θ err = %.1f° | v = %.2f | w = %.2f\n", ...
+                target(1), target(2), rho, rad2deg(error_theta), v, w);
+
+        % Criterio di arrivo
+        if rho < goal_tolerance && abs(error_theta) < angle_tolerance
+            reached = true;
+        end
+
+        pause(0.1);
+    end
 end
 
 % Stop finale
